@@ -2,8 +2,9 @@
 from astrbot.api.star import Star, Context
 from astrbot.api import logger
 
-# 绝对导入“类”并显式引用，避免“未使用导入”提示；
-# 同时确保模块被导入以触发 @register_provider_adapter 的注册（框架约定）
+# 绝对导入“类”并显式引用：
+# 1) 触发 ark_responses_provider 模块中的 @register_provider_adapter 注册（框架约定）
+# 2) 避免静态审查工具将导入判定为未使用
 from astrbot_plugin_provider_ark_responses.ark_responses_provider import (
     ArkResponsesProvider as _ArkProviderRef,
 )
@@ -14,8 +15,7 @@ class ArkResponsesProviderLoader(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        # 显式引用，避免静态审查工具将导入判定为未使用
-        _ = _ArkProviderRef
+        _ = _ArkProviderRef  # 确保 Provider 被加载和注册（见上方说明）
         logger.info(
             "[ArkResponsesProviderLoader] Ark Responses Provider 模块已加载"
         )
