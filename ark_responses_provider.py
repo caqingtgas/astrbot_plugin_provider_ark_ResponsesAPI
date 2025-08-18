@@ -2,16 +2,19 @@
 # Volcengine Ark Responses API Provider for AstrBot
 #
 # 变更摘要（2025-08-18）：
+# - 真·流式：text_chat_stream 采用 SSE 增量分块输出，支持 response.output_text.delta、response.completed
 # - tools 扁平化：{"type":"function","function":{...}} -> {"type":"function","name":...,"parameters":...,"description":...}
-# - expire_at 支持“秒为 TTL”，并夹紧到 now+3d，日志打印 UTC 到期时间
-# - 过期自动重建 + 历史重放（rehydrate）：默认“**不限制消息条数**”（rehydrate_max_messages=0）
-# - 将 reset/状态改写放入 skey_lock 临界区；收敛文件/JSON/网络异常捕获
-# - 重构 text_chat：拆分为 _handle_session_state_under_lock / _build_request_payload / _execute_api_call_with_retries
-# - raw_completion 使用 types.SimpleNamespace
+# - expire_at 支持“秒为 TTL”，并夹紧到 now+3d（常量 _MAX_EXPIRATION_SECONDS），日志打印 UTC 到期时间
+# - 过期自动重建 + 历史重放（rehydrate，默认不限条数；遵循你“由 AstrBot 决定上下文量”的要求）
+# - 状态读写统一置于 skey_lock 内，避免竞态；异常捕获收敛；raw_completion 使用 SimpleNamespace
+# - ClientSession 在 __init__ 创建并复用；close() 统一释放
 #
-# 依赖：aiohttp
-
-from __future__ import annotations
+# 说明：移除了 `from __future__ import annotations`（为简化而移除；非因“3.10 已默认”，该说法并不准确）。
+# 参考：
+# - aiohttp 官方建议：应用生命周期内尽量复用单个 ClientSession（连接池/keepalive）。   https://docs.aiohttp.org/en/stable/client_reference.html#client-session
+# - OpenAI Responses 流式事件：response.output_text.delta / response.completed。    https://platform.openai.com/docs/api-reference/responses-streaming/response
+# - OpenAI Agents SDK 对应事件示例（响应为 Responses 事件流）。                   https://openai.github.io/openai-agents-python/streaming/
+# - BytePlus/ModelArk 流式事件（同类产品的 response.* 事件流模型）。                https://docs.byteplus.com/en/docs/ModelArk/Streaming_Response
 
 import asyncio
 import json
@@ -41,16 +44,15 @@ class _RespState:
 @register_provider_adapter(
     "ark_responses",
     "Volcengine Ark (Responses API)",
-    provider_type=ProviderType.CHAT_COMPLEION,
+    provider_type=ProviderType.CHAT_COMPLETION,
 )
 class ArkResponsesProvider(Provider):
     """
-    非流式稳定实现：
-    - POST /responses（非流式）
-    - 自动管理 previous_response_id（创建/复用/失效自动重建）
-    - 解析工具调用并转换为 AstrBot 的 LLMResponse(tool)
-    - 打印 usage & cached_tokens
+    - 非流式：POST /responses，支持 previous_response_id，自动重建与历史重放
+    - 流式：POST /responses?stream=true（SSE），逐块输出 delta，完成时汇总 usage/id
     """
+
+    _MAX_EXPIRATION_SECONDS = 3 * 24 * 3600  # 3 days
 
     # -------------- 构造 & 基础 --------------
     def __init__(self, provider_config: dict, provider_settings: dict, default_persona=None):
@@ -79,8 +81,10 @@ class ArkResponsesProvider(Provider):
             self._rehydrate_max_messages = 0
         self._rehydrate_strip_images: bool = bool(provider_config.get("rehydrate_strip_images", True))
 
-        # HTTP 会话
-        self._session: Optional[aiohttp.ClientSession] = None
+        # HTTP 会话（应用生命周期内复用）
+        self._session: Optional[aiohttp.ClientSession] = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self._timeout)
+        )
 
         # 会话状态（持久化）
         data_dir = StarTools.get_data_dir("astrbot_plugin_provider_ark_responses")
@@ -165,6 +169,7 @@ class ArkResponsesProvider(Provider):
 
     # -------------- 内部：HTTP --------------
     async def _sess(self) -> aiohttp.ClientSession:
+        # 统一复用；若在运行期被关闭则重建一次
         if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout))
         return self._session
@@ -175,11 +180,16 @@ class ArkResponsesProvider(Provider):
             "Content-Type": "application/json",
         }
 
-    async def _post_responses(self, payload: dict) -> Tuple[int, Union[dict, str]]:
+    async def _post_responses(self, payload: dict, *, stream: bool = False) -> Tuple[int, Union[dict, str, aiohttp.ClientResponse]]:
         url = f"{self._base}/responses"
-        async with (await self._sess()).post(url, json=payload, headers=self._headers()) as resp:
+        sess = await self._sess()
+        if stream:
+            resp = await sess.post(url, json=payload, headers=self._headers())
+            return resp.status, resp  # 流式直接返回响应对象，由调用者迭代
+        async with sess.post(url, json=payload, headers=self._headers()) as resp:
             ct = resp.content_type
-            data: Union[dict, str] = await (resp.json() if ct == "application/json" else resp.text())
+            data: Union[dict, str]
+            data = await (resp.json() if ct == "application/json" else resp.text())
             return resp.status, data
 
     async def _delete_response(self, resp_id: str) -> Tuple[int, Union[dict, str]]:
@@ -188,7 +198,8 @@ class ArkResponsesProvider(Provider):
         url = f"{self._base}/responses/{resp_id}"
         async with (await self._sess()).delete(url, headers=self._headers()) as resp:
             ct = resp.content_type
-            data: Union[dict, str] = await (resp.json() if ct == "application/json" else resp.text())
+            data: Union[dict, str]
+            data = await (resp.json() if ct == "application/json" else resp.text())
             return resp.status, data
 
     def _rotate_key(self):
@@ -332,20 +343,23 @@ class ArkResponsesProvider(Provider):
             return
 
         now = int(time.time())
-        MAX = 3 * 24 * 3600  # 3 days
+        MAX = self._MAX_EXPIRATION_SECONDS
         if sec <= MAX:
             ttl = int(max(0, sec))
             ts = now + ttl
             cfg["expire_at"] = ts
-            logger.info("[ArkResponses] expire_at: TTL=%ss -> epoch=%s, utc=%s (max=3d)", ttl, ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat())
+            logger.info("[ArkResponses] expire_at: TTL=%ss -> epoch=%s, utc=%s (max=3d)",
+                        ttl, ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat())
         else:
             ts = int(sec)
             max_ts = now + MAX
             if ts > max_ts:
-                logger.warning("[ArkResponses] expire_at epoch (%s) exceeds max (now+3d=%s); clamping to max.", ts, max_ts)
+                logger.warning("[ArkResponses] expire_at epoch (%s) exceeds max (now+3d=%s); clamping to max.",
+                               ts, max_ts)
                 ts = max_ts
                 cfg["expire_at"] = ts
-            logger.info("[ArkResponses] expire_at: epoch=%s, utc=%s", ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat())
+            logger.info("[ArkResponses] expire_at: epoch=%s, utc=%s",
+                        ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat())
 
     def _parse_usage(self, data: dict) -> Dict[str, Any]:
         usage = data.get("usage") or {}
@@ -451,14 +465,13 @@ class ArkResponsesProvider(Provider):
             return any(k in s for k in keywords)
         return False
 
-    # -------------- 拆分后的主流程 --------------
+    # -------------- 会话状态（锁内） --------------
     async def _handle_session_state_under_lock(self, skey: str, contexts: Optional[List[dict]]) -> Tuple[_RespState, bool, Optional[str], bool]:
         """在 skey_lock 内处理会话状态：/reset、复用或新建。返回 (state, first_round, previous_id, first_call_after_reset)"""
         state = self._state.get(skey) or _RespState()
         first_call_after_reset = False
 
-        # Pythonic：None / [] 都视作 False
-        if not contexts:
+        if not contexts:  # None / [] 都视作 False
             if state.last_id:
                 old = state.last_id
                 if self._auto_delete_on_reset:
@@ -476,42 +489,7 @@ class ArkResponsesProvider(Provider):
         previous_id = state.last_id if not first_round else None
         return state, first_round, previous_id, first_call_after_reset
 
-    def _build_request_payload(
-        self,
-        *,
-        model_name: str,
-        cfg: Dict[str, Any],
-        first_round: bool,
-        previous_id: Optional[str],
-        func_tool,
-        system_prompt: Optional[str],
-        prompt: Optional[str],
-        tool_calls_result: Optional[Union[ToolCallsResult, List[ToolCallsResult]]],
-        rehydrate_messages: Optional[List[dict]],
-        state: _RespState,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"model": model_name, "input": [], "stream": False}
-        if previous_id:
-            payload["previous_response_id"] = previous_id
-        # 透传模型配置 & 归一化 expire_at
-        self._normalize_expire_at(cfg)
-        for k, v in cfg.items():
-            if k != "model":
-                payload[k] = v
-
-        # 首轮才携带 tools（Ark 限制）
-        if first_round and not state.tools_sent and func_tool:
-            self._attach_tools_if_first_round(payload, func_tool)
-
-        payload["input"] = self._build_input_array(
-            first_round=first_round,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            tool_calls_result=tool_calls_result,
-            rehydrate_messages=rehydrate_messages,
-        )
-        return payload
-
+    # -------------- 调用 & 重试（非流式） --------------
     async def _execute_api_call_with_retries(
         self,
         *,
@@ -526,10 +504,10 @@ class ArkResponsesProvider(Provider):
         skey: str,
     ) -> Tuple[dict, bool, Optional[str]]:
         """
-        执行带重试的 API 调用。
+        执行带重试的 API 调用（非流式）。
         返回：(data, rehydrated, previous_id_used)
         """
-        payload = dict(base_payload)  # 浅拷贝以便在错误路径上重建
+        payload = dict(base_payload)  # 浅拷贝
         previous_id_used = payload.get("previous_response_id")
         last_err: Optional[BaseException] = None
 
@@ -538,12 +516,11 @@ class ArkResponsesProvider(Provider):
                 await asyncio.sleep(self._retry_sleep * attempt)
 
             try:
-                status, data = await self._post_responses(payload)
+                status, data = await self._post_responses(payload, stream=False)
 
                 # previous_response_id 失效：重建 +（可选）历史重放
                 if self._is_prev_id_invalid(status, data):
                     logger.warning("[ArkResponses] previous_response_id invalid -> recreate session and retry")
-                    # 将状态重置为“新首轮”
                     state.last_id = ""
                     state.tools_sent = False
                     self._state[skey] = state
@@ -554,7 +531,6 @@ class ArkResponsesProvider(Provider):
                         rehydrate_msgs = self._contexts_to_ark_messages(contexts)
                         logger.info("[ArkResponses] rehydrate on recreate: %d messages injected", len(rehydrate_msgs))
 
-                    # 新首轮载荷（移除 previous_id，重新附加 tools）
                     payload.pop("previous_response_id", None)
                     payload.pop("tools", None)
                     if func_tool:
@@ -567,7 +543,7 @@ class ArkResponsesProvider(Provider):
                         tool_calls_result=tool_calls_result,
                         rehydrate_messages=rehydrate_msgs or None,
                     )
-                    status, data = await self._post_responses(payload)
+                    status, data = await self._post_responses(payload, stream=False)
                     if not (isinstance(data, dict) and status < 400):
                         raise RuntimeError(f"ArkResponses error http={status}, data={data}")
                     return data, bool(rehydrate_msgs), previous_id_used
@@ -596,7 +572,37 @@ class ArkResponsesProvider(Provider):
             raise last_err
         raise RuntimeError("ArkResponses: unknown error")
 
-    # -------------- Provider 主流程（已瘦身） --------------
+    # -------------- SSE 迭代工具（流式） --------------
+    async def _iterate_sse(self, resp: aiohttp.ClientResponse):
+        """
+        解析 SSE 帧，yield (event, data_str)
+        兼容两种格式：
+        1) 带 'event:' 与 'data:' 的标准 SSE
+        2) 仅 'data:'，其中 JSON 自带 'type' 字段
+        """
+        buffer = b""
+        async for chunk in resp.content.iter_any():
+            if not chunk:
+                continue
+            buffer += chunk
+            while b"\n\n" in buffer:
+                block, buffer = buffer.split(b"\n\n", 1)
+                try:
+                    lines = block.decode("utf-8", errors="ignore").splitlines()
+                except Exception:
+                    continue
+                event_type = None
+                data_lines = []
+                for line in lines:
+                    s = line.strip()
+                    if s.startswith("event:"):
+                        event_type = s[6:].strip()
+                    elif s.startswith("data:"):
+                        data_lines.append(s[5:].lstrip())
+                data_str = "\n".join(data_lines).strip()
+                yield event_type, data_str
+
+    # -------------- Provider 主流程（非流式） --------------
     async def text_chat(
         self,
         prompt: str,
@@ -625,20 +631,25 @@ class ArkResponsesProvider(Provider):
 
             # 构建基础 payload（不含“因失效重建”的历史重放）
             cfg = self._model_config()
-            payload = self._build_request_payload(
-                model_name=model_name,
-                cfg=cfg,
+            self._normalize_expire_at(cfg)
+
+            payload: Dict[str, Any] = {"model": model_name, "input": [], "stream": False}
+            if previous_id:
+                payload["previous_response_id"] = previous_id
+            for k, v in cfg.items():
+                if k != "model":
+                    payload[k] = v
+            if first_round and not state.tools_sent and func_tool:
+                self._attach_tools_if_first_round(payload, func_tool)
+
+            payload["input"] = self._build_input_array(
                 first_round=first_round,
-                previous_id=previous_id,
-                func_tool=func_tool,
-                system_prompt=system_prompt,
                 prompt=prompt,
+                system_prompt=system_prompt,
                 tool_calls_result=tool_calls_result,
                 rehydrate_messages=None,
-                state=state,
             )
 
-            # 带重试调用（内部处理 prev_id 失效→重建并可选重放）
             data, rehydrated, prev_used = await self._execute_api_call_with_retries(
                 base_payload=payload,
                 contexts=contexts,
@@ -663,7 +674,6 @@ class ArkResponsesProvider(Provider):
             self._state[skey] = state
             await self._save_state()
 
-            # 返回 LLMResponse
             return self._build_llm_response(
                 assistant_text=assistant_text,
                 function_calls=fcs,
@@ -672,7 +682,7 @@ class ArkResponsesProvider(Provider):
                 previous_response_id=prev_used,
             )
 
-    # -------------- 简化的“流式”包装：一次性产出 --------------
+    # -------------- Provider 主流程（流式） --------------
     async def text_chat_stream(
         self,
         prompt: str,
@@ -685,16 +695,169 @@ class ArkResponsesProvider(Provider):
         model: str | None = None,
         **kwargs,
     ):
-        resp = await self.text_chat(
-            prompt=prompt,
-            session_id=session_id,
-            image_urls=image_urls,
-            func_tool=func_tool,
-            contexts=contexts,
-            system_prompt=system_prompt,
-            tool_calls_result=tool_calls_result,
-            model=model,
-            **kwargs,
-        )
-        resp.is_chunk = False
-        yield resp
+        """
+        真·流式实现：逐块输出 delta，最后输出一个“收尾块”（不重复内容，带 usage/id）
+        事件模型参考：
+          - OpenAI Responses: response.output_text.delta / response.completed
+          - BytePlus/ModelArk: response.in_progress / response.completed / response.failed
+        """
+        await self._ensure_state_loaded()
+
+        if not self.get_current_key():
+            raise RuntimeError("ArkResponses: API Key not configured")
+
+        model_name = self._ensure_model(model)
+        skey = (session_id or "global").strip()
+
+        # 锁内处理状态（与非流式一致）
+        skey_lock = await self._get_skey_lock(skey)
+        async with skey_lock:
+            state, first_round, previous_id, _ = await self._handle_session_state_under_lock(skey, contexts)
+
+            cfg = self._model_config()
+            self._normalize_expire_at(cfg)
+
+            payload: Dict[str, Any] = {"model": model_name, "input": [], "stream": True}
+            if previous_id:
+                payload["previous_response_id"] = previous_id
+            for k, v in cfg.items():
+                if k != "model":
+                    payload[k] = v
+            if first_round and not state.tools_sent and func_tool:
+                self._attach_tools_if_first_round(payload, func_tool)
+
+            payload["input"] = self._build_input_array(
+                first_round=first_round,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                tool_calls_result=tool_calls_result,
+                rehydrate_messages=None,
+            )
+
+            # 发起流式请求
+            status, resp_obj = await self._post_responses(payload, stream=True)
+            if not isinstance(resp_obj, aiohttp.ClientResponse):
+                raise RuntimeError(f"ArkResponses stream error http={status}, data={resp_obj}")
+            resp = resp_obj
+
+            if status >= 400:
+                try:
+                    err = await resp.json()
+                except Exception:
+                    err = await resp.text()
+                # 如果 previous_id 失效，走重建路径（与非流式一致）
+                if self._is_prev_id_invalid(status, err):
+                    logger.warning("[ArkResponses] previous_response_id invalid (stream) -> recreate session and retry")
+                    # 清 state 并重放
+                    state.last_id = ""
+                    state.tools_sent = False
+                    self._state[skey] = state
+                    await self._save_state()
+
+                    rehydrate_msgs: List[dict] = []
+                    if self._rehydrate_on_recreate and contexts:
+                        rehydrate_msgs = self._contexts_to_ark_messages(contexts)
+                        logger.info("[ArkResponses] rehydrate on recreate (stream): %d messages injected", len(rehydrate_msgs))
+
+                    # 新首轮载荷
+                    payload.pop("previous_response_id", None)
+                    payload.pop("tools", None)
+                    if func_tool:
+                        self._attach_tools_if_first_round(payload, func_tool)
+                    payload["input"] = self._build_input_array(
+                        first_round=True,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        tool_calls_result=tool_calls_result,
+                        rehydrate_messages=rehydrate_msgs or None,
+                    )
+
+                    status2, resp_obj2 = await self._post_responses(payload, stream=True)
+                    if not isinstance(resp_obj2, aiohttp.ClientResponse):
+                        raise RuntimeError(f"ArkResponses stream error http={status2}, data={resp_obj2}")
+                    resp = resp_obj2
+                    if status2 >= 400:
+                        try:
+                            err2 = await resp.json()
+                        except Exception:
+                            err2 = await resp.text()
+                        raise RuntimeError(f"ArkResponses stream error http={status2}, data={err2}")
+                else:
+                    raise RuntimeError(f"ArkResponses stream error http={status}, data={err}")
+
+            # 正常流
+            new_id: str = ""
+            prev_used = previous_id
+            usage_final: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0, "raw": {}}
+
+            try:
+                async for event, data_str in self._iterate_sse(resp):
+                    if not data_str:
+                        continue
+                    if data_str == "[DONE]":
+                        break
+
+                    # 解析 JSON；兼容“只有 data，没有 event”的情况（JSON 内带 type）
+                    try:
+                        obj = json.loads(data_str)
+                    except Exception:
+                        continue
+
+                    evt = (event or obj.get("type") or "").strip()
+
+                    # 增量文本
+                    if evt.endswith("response.output_text.delta") or evt.endswith("output_text.delta"):
+                        delta = obj.get("delta") or obj.get("text") or ""
+                        if delta:
+                            chunk = LLMResponse(role="assistant", completion_text=str(delta))
+                            chunk.is_chunk = True
+                            yield chunk
+                        continue
+
+                    # 完成事件，带最终 response（含 usage/id）
+                    if evt.endswith("response.completed") or evt.endswith("response.complete") or evt.endswith("response.done"):
+                        response_obj = obj.get("response") or obj
+                        if isinstance(response_obj, dict):
+                            # 尝试提取 usage 与 id
+                            usage_final = self._parse_usage(response_obj)
+                            new_id = str(response_obj.get("id") or new_id)
+                        continue
+
+                    # 失败/中断事件
+                    if evt.endswith("response.failed") or evt.endswith("response.incomplete") or evt.endswith("response.error"):
+                        # 尽力带出错误信息
+                        msg = obj.get("error", {}).get("message") or obj.get("message") or data_str
+                        raise RuntimeError(f"ArkResponses stream failed: {msg}")
+
+            finally:
+                if not resp.content.at_eof():
+                    try:
+                        await resp.release()
+                    except Exception:
+                        pass
+
+            # 更新状态（以完成事件中的 id 为准）
+            if new_id:
+                state.last_id = new_id
+            if (first_round or ("tools" in payload)) and (not state.tools_sent):
+                state.tools_sent = True
+            self._state[skey] = state
+            await self._save_state()
+
+            # 发送一个“收尾块”（不重复文本，只携 usage/ids），便于 AstrBot 统计
+            tail = LLMResponse(role="assistant", completion_text="")
+            tail.is_chunk = False
+            tail.raw_completion = SimpleNamespace(
+                usage=SimpleNamespace(
+                    prompt_tokens=usage_final.get("prompt_tokens", 0),
+                    completion_tokens=usage_final.get("completion_tokens", 0),
+                    total_tokens=usage_final.get("total_tokens", 0),
+                )
+            )
+            tail.extra = {
+                "ark_usage": usage_final.get("raw", {}),
+                "ark_cached_tokens": usage_final.get("cached_tokens", 0),
+                "ark_response_id": new_id,
+                "ark_previous_response_id": prev_used,
+            }
+            yield tail
