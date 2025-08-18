@@ -117,10 +117,12 @@ class ArkResponsesProvider(Provider):
         )
 
         # 会话状态（本地持久化）
-        data_dir = StarTools.get_data_dir(
+        data_dir: Path = StarTools.get_data_dir(
             "astrbot_plugin_provider_ark_responses"
         )
-        self._state_path: Path = Path(data_dir) / "responses_state.json"
+        # 修复：StarTools.get_data_dir 已返回 Path；直接使用 / 连接（pathlib 运算符）
+        # 参考官方文档：pathlib Path 支持用 `/` 拼接子路径。&#8203;:contentReference[oaicite:3]{index=3}
+        self._state_path: Path = data_dir / "responses_state.json"
         self._state_lock = asyncio.Lock()
         self._state_loaded = False
         self._state: Dict[str, _RespState] = {}
@@ -346,9 +348,8 @@ class ArkResponsesProvider(Provider):
             if text:
                 filtered.append({"role": role, "content": text})
 
-        # 仅当配置了 >0 时才裁剪；0 表示不限量
-        if (isinstance(self._rehydrate_max_messages, int)
-                and self._rehydrate_max_messages > 0):
+        # 简化：__init__ 已保证为 int
+        if self._rehydrate_max_messages > 0:
             n = self._rehydrate_max_messages
             if len(filtered) > n:
                 filtered = filtered[-n:]
@@ -384,7 +385,7 @@ class ArkResponsesProvider(Provider):
         prompt: Optional[str],
         system_prompt: Optional[str],
         tool_calls_result: Optional[
-            Union[ToolCallsResult, List[ToolCallsResult]]
+            Union[ToolCallsResult, List[ToolCallsResult], None]
         ],
         rehydrate_messages: Optional[List[dict]] = None,
     ) -> List[dict]:
