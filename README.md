@@ -12,7 +12,7 @@
 为什么不用 Context API？它针对老模型，但**不支持 Function Calling**，限制了联网/工具能力。  
 **Responses API** 是针对 **doubao-seed-1.6 系列**的缓存方案，采用**会话接力**：首轮创建一个 `response_id`，后续用 `previous_response_id` 接力输出 **新** `response_id`。更重要的是，它**支持 Function Calling**，可同时拥有“缓存降费 + 工具调用”。
 
-### 功能
+## 功能
 - **session上下文缓存**：自动串联 `previous_response_id`，输出 `resp_id` 与 `prev_id`。  
 - **Function Calling**：自动按照 Responses API 的 `tools` 规范传参与回填。  
 - **命中统计**：控制台打印 `cached_tokens` 等用量信息。  
