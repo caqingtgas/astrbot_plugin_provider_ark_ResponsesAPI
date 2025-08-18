@@ -1,0 +1,6 @@
+name: astrbot_plugin_provider_ark_ResponsesAPI
+desc: 将火山方舟(Volcengine Ark)的上下文缓存API(Responses API)注册为 AstrBot 的对话服务提供商(Provider)(支持/provider、缓存命中统计、Function Calling)
+version: 1.0.0
+author: CaQing ＆ GPT-5 Thinking
+repo: https://github.com/caqingtgas/astrbot_plugin_provider_ark_ResponsesAPI
+
