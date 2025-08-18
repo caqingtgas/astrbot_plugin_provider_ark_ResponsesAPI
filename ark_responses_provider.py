@@ -5,7 +5,8 @@
 # - tools 扁平化：{"type":"function","function":{...}} -> {"type":"function","name":...,"parameters":...,"description":...}
 # - expire_at 支持“秒为 TTL”，并夹紧到 now+3d，日志打印 UTC 到期时间
 # - 过期自动重建 + 历史重放（rehydrate）：默认“**不限制消息条数**”（rehydrate_max_messages=0）
-# - 修正 _ensure_state_loaded() 早期稿的拼写问题
+# - 修正 _ensure_state_loaded() 的异常捕获；raw_completion 改为 SimpleNamespace
+# - 将 reset/状态改写移入 skey_lock 临界区，修复潜在并发竞态
 #
 # 依赖：aiohttp
 
@@ -18,10 +19,11 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from types import SimpleNamespace
 
 import aiohttp
 
-from astrbot import logger
+from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.register import register_provider_adapter
@@ -127,7 +129,8 @@ class ArkResponsesProvider(Provider):
                 return
             try:
                 if self._state_path.exists():
-                    raw = json.loads(self._state_path.read_text(encoding="utf-8"))
+                    text = self._state_path.read_text(encoding="utf-8")
+                    raw = json.loads(text)
                     for skey, v in (raw.get("map") or {}).items():
                         self._state[str(skey)] = _RespState(
                             last_id=str(v.get("last_id") or ""),
@@ -135,8 +138,8 @@ class ArkResponsesProvider(Provider):
                         )
                     if self._state:
                         logger.info("[ArkResponses] loaded %d response bindings from %s", len(self._state), self._state_path)
-            except Exception as e:
-                logger.warning("[ArkResponses] load state failed: %s", e)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning("[ArkResponses] load state failed (%s): %s", e.__class__.__name__, e)
             finally:
                 self._state_loaded = True
 
@@ -148,8 +151,8 @@ class ArkResponsesProvider(Provider):
                 tmp = self._state_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 tmp.replace(self._state_path)
-            except Exception as e:
-                logger.warning("[ArkResponses] save state failed: %s", e)
+            except OSError as e:
+                logger.warning("[ArkResponses] save state failed (%s): %s", e.__class__.__name__, e)
 
     async def _get_skey_lock(self, skey: str) -> asyncio.Lock:
         async with self._skey_dict_lock:
@@ -227,9 +230,7 @@ class ArkResponsesProvider(Provider):
                     if isinstance(item, dict):
                         if "text" in item:
                             parts.append(str(item.get("text") or ""))
-                        elif not self._rehydrate_strip_images and "image_url" in item:
-                            # 如需重放图片，可在此扩展 Ark 的图文结构；默认忽略图片片段
-                            pass
+                        # 如需重放图片，可在此扩展 Ark 的图文结构；默认忽略图片片段
                     else:
                         parts.append(str(item))
                 return "".join(parts).strip()
@@ -432,13 +433,14 @@ class ArkResponsesProvider(Provider):
                 raise RuntimeError("ArkResponses: completion is empty and no function calls")
             llm = LLMResponse(role="assistant", completion_text=str(assistant_text))
 
-        class _Raw: ...
-        raw = _Raw()
-        raw.usage = _Raw()
-        raw.usage.prompt_tokens = usage_info["prompt_tokens"]
-        raw.usage.completion_tokens = usage_info["completion_tokens"]
-        raw.usage.total_tokens = usage_info["total_tokens"]
-        llm.raw_completion = raw
+        # 使用 SimpleNamespace 构造 raw_completion（点号访问友好）
+        llm.raw_completion = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=usage_info["prompt_tokens"],
+                completion_tokens=usage_info["completion_tokens"],
+                total_tokens=usage_info["total_tokens"],
+            )
+        )
 
         try:
             llm.extra = {
@@ -490,26 +492,27 @@ class ArkResponsesProvider(Provider):
         model_name = self._ensure_model(model)
         skey = (session_id or "global").strip()
 
-        # /reset：AstrBot 清空 contexts 时，主动丢弃已记录的 response_id
-        first_call_after_reset = False
-        state_before = self._state.get(skey)
-        if (contexts is None) or (isinstance(contexts, list) and len(contexts) == 0):
-            if state_before and state_before.last_id:
-                old = state_before.last_id
-                if self._auto_delete_on_reset:
-                    try:
-                        st, _ = await self._delete_response(old)
-                        logger.info("[ArkResponses] reset -> delete old response_id=%s (status=%s)", old, st)
-                    except Exception as e:
-                        logger.warning("[ArkResponses] reset delete failed for %s: %s", old, e)
-                self._state.pop(skey, None)
-                await self._save_state()
-            first_call_after_reset = True
-
-        # skey 互斥，避免并发创建
+        # skey 互斥锁 —— 将读取/重置/删除等状态变更移入锁内，避免竞态
         skey_lock = await self._get_skey_lock(skey)
         async with skey_lock:
+            # /reset：AstrBot 清空 contexts 时，主动丢弃已记录的 response_id
+            first_call_after_reset = False
             state = self._state.get(skey) or _RespState()
+            if (contexts is None) or (isinstance(contexts, list) and len(contexts) == 0):
+                if state.last_id:
+                    old = state.last_id
+                    if self._auto_delete_on_reset:
+                        try:
+                            st, _ = await self._delete_response(old)
+                            logger.info("[ArkResponses] reset -> delete old response_id=%s (status=%s)", old, st)
+                        except Exception as e:
+                            logger.warning("[ArkResponses] reset delete failed for %s: %s", old, e)
+                # 清空并保存
+                state = _RespState()
+                self._state[skey] = state
+                await self._save_state()
+                first_call_after_reset = True
+
             first_round = first_call_after_reset or (not state.last_id)
 
             # 可能的重放消息（只有在“重建”首轮时使用）
@@ -544,7 +547,7 @@ class ArkResponsesProvider(Provider):
                 rehydrate_messages=None,
             )
 
-            # 调用（带重试）
+            # 调用（带重试与自动重建）
             last_err: Optional[Exception] = None
             for attempt in range(self._max_retries):
                 if attempt > 0:
