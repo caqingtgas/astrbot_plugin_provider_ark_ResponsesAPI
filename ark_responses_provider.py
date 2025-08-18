@@ -118,10 +118,9 @@ class ArkResponsesProvider(Provider):
 
         # 会话状态（本地持久化）
         data_dir: Path = StarTools.get_data_dir(
-            "astrbot_plugin_provider_ark_responses"
+            # 修正为与真实插件目录一致（大小写敏感）
+            "astrbot_plugin_provider_ark_ResponsesAPI"
         )
-        # 修复：StarTools.get_data_dir 已返回 Path；直接使用 / 连接（pathlib 运算符）
-        # 参考官方文档：pathlib Path 支持用 `/` 拼接子路径。&#8203;:contentReference[oaicite:3]{index=3}
         self._state_path: Path = data_dir / "responses_state.json"
         self._state_lock = asyncio.Lock()
         self._state_loaded = False
