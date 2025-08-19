@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 # Volcengine Ark Responses API Provider for AstrBot
 #
-# 变更摘要（2025-08-18）：
-# - 真·流式：SSE 增量分块输出（response.output_text.delta / response.completed）
-# - tools 扁平化：{"type":"function","function":{...}}
-#                 -> {"type":"function","name":...,"parameters":...,"description":...}
-# - expire_at 支持“秒为 TTL”，并夹紧到 now+3d（_MAX_EXPIRATION_SECONDS），打印 UTC 到期时间
-# - previous_response_id 失效：自动重建 +（可选）历史重放（上下文量由 AstrBot 决定）
-# - 状态读写均在 skey_lock 内，避免竞态；异常捕获收敛；raw_completion 用 SimpleNamespace
-# - ClientSession 在 __init__ 创建并复用；close() 统一释放（复用连接池）
+# 变更摘要（2025-08-19）：
+# - 抽取 _build_base_payload()，减少 text_chat / text_chat_stream 的重复代码
+# - 为流式重建流程补充 rehydrated 标志；末尾据此更新 state.tools_sent（与非流式保持一致）
+# - 其余逻辑保持不变（SSE/重试/TTL/持久化/锁控制等），保证稳定上线
 #
 # 参考：
 # - PEP 8（导入风格/行长）：https://peps.python.org/pep-0008/             # noqa
@@ -17,7 +13,6 @@
 #   https://docs.aiohttp.org/en/stable/client_advanced.html               # noqa
 # - OpenAI Responses 流式事件：                                           # noqa
 #   https://platform.openai.com/docs/guides/streaming-responses           # noqa
-#   https://openai.github.io/openai-agents-python/streaming/              # noqa
 # - SSE 规范与示例：                                                      # noqa
 #   https://www.w3.org/TR/eventsource/                                    # noqa
 #   https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events  # noqa
@@ -118,7 +113,7 @@ class ArkResponsesProvider(Provider):
 
         # 会话状态（本地持久化）
         data_dir: Path = StarTools.get_data_dir(
-            # 修正为与真实插件目录一致（大小写敏感）
+            # 保持与真实插件目录一致（大小写敏感）
             "astrbot_plugin_provider_ark_ResponsesAPI"
         )
         self._state_path: Path = data_dir / "responses_state.json"
@@ -590,6 +585,28 @@ class ArkResponsesProvider(Provider):
         )
         return llm
 
+    # -------------------- 新增：公共 payload 构建 --------------------
+    def _build_base_payload(
+        self,
+        *,
+        model_name: str,
+        previous_id: Optional[str],
+        stream: bool,
+        cfg: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "input": [],
+            "stream": bool(stream),
+        }
+        if previous_id:
+            payload["previous_response_id"] = previous_id
+        # 合并 model_config 里的其余字段
+        for k, v in cfg.items():
+            if k != "model":
+                payload[k] = v
+        return payload
+
     # -------------------- 错误识别 --------------------
     def _is_prev_id_invalid(
         self,
@@ -812,20 +829,16 @@ class ArkResponsesProvider(Provider):
             state, first_round, previous_id, _ = (
                 await self._handle_session_state_under_lock(skey, contexts)
             )
-
-            # 基础 payload
             cfg = self._model_config()
             self._normalize_expire_at(cfg)
-            payload: Dict[str, Any] = {
-                "model": model_name,
-                "input": [],
-                "stream": False,
-            }
-            if previous_id:
-                payload["previous_response_id"] = previous_id
-            for k, v in cfg.items():
-                if k != "model":
-                    payload[k] = v
+
+            # 公共 payload
+            payload = self._build_base_payload(
+                model_name=model_name,
+                previous_id=previous_id,
+                stream=False,
+                cfg=cfg,
+            )
             if first_round and not state.tools_sent and func_tool:
                 self._attach_tools_if_first_round(payload, func_tool)
             payload["input"] = self._build_input_array(
@@ -898,19 +911,16 @@ class ArkResponsesProvider(Provider):
             state, first_round, previous_id, _ = (
                 await self._handle_session_state_under_lock(skey, contexts)
             )
-
             cfg = self._model_config()
             self._normalize_expire_at(cfg)
-            payload: Dict[str, Any] = {
-                "model": model_name,
-                "input": [],
-                "stream": True,
-            }
-            if previous_id:
-                payload["previous_response_id"] = previous_id
-            for k, v in cfg.items():
-                if k != "model":
-                    payload[k] = v
+
+            # 公共 payload
+            payload = self._build_base_payload(
+                model_name=model_name,
+                previous_id=previous_id,
+                stream=True,
+                cfg=cfg,
+            )
             if first_round and not state.tools_sent and func_tool:
                 self._attach_tools_if_first_round(payload, func_tool)
             payload["input"] = self._build_input_array(
@@ -930,6 +940,8 @@ class ArkResponsesProvider(Provider):
                     f"ArkResponses stream error http={status}, data={resp_obj}"
                 )
             resp = resp_obj
+
+            rehydrated = False  # <<< 新增：跟踪是否注入了历史消息
 
             if status >= 400:
                 try:
@@ -954,6 +966,7 @@ class ArkResponsesProvider(Provider):
                     rehydrate_msgs: List[dict] = []
                     if self._rehydrate_on_recreate and contexts:
                         rehydrate_msgs = self._contexts_to_ark_messages(contexts)
+                        rehydrated = bool(rehydrate_msgs)  # <<< 新增：设置标志
                         logger.info(
                             "[ArkResponses] rehydrate on recreate (stream): "
                             "%d messages injected",
@@ -1070,7 +1083,8 @@ class ArkResponsesProvider(Provider):
             # 更新状态（以完成事件中的 id 为准）
             if new_id:
                 state.last_id = new_id
-            if (first_round or ("tools" in payload)) and (not state.tools_sent):
+            # <<< 修正：将 rehydrated 纳入 tools_sent 的更新条件，与非流式保持一致
+            if (first_round or rehydrated) and ("tools" in payload) and (not state.tools_sent):
                 state.tools_sent = True
             self._state[skey] = state
             await self._save_state()
