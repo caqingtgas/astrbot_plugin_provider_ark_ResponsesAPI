@@ -11,7 +11,8 @@ class ArkResponsesProviderLoader(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        # 显式引用以触发 ark_responses_provider 中的 @register_provider_adapter 注册
+        # 触发 ark_responses_provider 中的 @register_provider_adapter 注册。
+        # 注意：此引用仅用于“加载并注册”，并不直接在此文件中使用。
         _ = _ArkProviderRef  # 确保 Provider 被加载和注册
         logger.info(
             "[ArkResponsesProviderLoader] Ark Responses Provider 模块已加载"
