@@ -66,7 +66,8 @@ class ArkResponsesProvider(Provider):
         provider_settings: dict,
         default_persona=None,
     ):
-        super().__init__(provider_config, provider_settings, default_persona)
+        # AstrBot 新版 Provider 仅接受 (provider_config, provider_settings)
+        super().__init__(provider_config, provider_settings)
 
         # 基础配置
         self._keys: List[str] = [
@@ -138,7 +139,7 @@ class ArkResponsesProvider(Provider):
         )
 
     # -------------------- AstrBot Provider 接口 --------------------
-    def get_models(self) -> List[str]:
+    async def get_models(self) -> List[str]:
         m = self.provider_config.get("models")
         if isinstance(m, list) and m:
             return m
@@ -383,13 +384,21 @@ class ArkResponsesProvider(Provider):
         ],
         rehydrate_messages: Optional[List[dict]] = None,
     ) -> List[dict]:
+        """
+        构建 Ark input：
+        - 首轮可带 system_prompt + rehydrate_messages
+        - 仅在“非首轮”时才注入工具输出，避免：
+          previous_response_id 失效后重建会话时，出现
+          “No tool calls but found tool output”
+        """
         items: List[dict] = []
         if first_round and system_prompt:
             items.append(self._make_system_message(system_prompt))
         if first_round and rehydrate_messages:
             items.extend(rehydrate_messages)
 
-        if tool_calls_result:
+        # 关键修改：只有在非首轮时才注入 tool output
+        if tool_calls_result and (not first_round):
             if isinstance(tool_calls_result, ToolCallsResult):
                 msgs = tool_calls_result.to_openai_messages()
                 items.extend(self._openai_msgs_to_function_outputs(msgs))
@@ -723,11 +732,13 @@ class ArkResponsesProvider(Provider):
                     if func_tool:
                         self._attach_tools_if_first_round(payload, func_tool)
 
+                    # 重建会话时不再携带上一轮 tool_outputs，避免
+                    # “No tool calls but found tool output”
                     payload["input"] = self._build_input_array(
                         first_round=True,
                         prompt=prompt,
                         system_prompt=system_prompt,
-                        tool_calls_result=tool_calls_result,
+                        tool_calls_result=None,
                         rehydrate_messages=rehydrate_msgs or None,
                     )
                     status, data = await self._post_responses(
@@ -941,7 +952,7 @@ class ArkResponsesProvider(Provider):
                 )
             resp = resp_obj
 
-            rehydrated = False  # <<< 新增：跟踪是否注入了历史消息
+            rehydrated = False  # 跟踪是否注入了历史消息
 
             if status >= 400:
                 try:
@@ -966,7 +977,7 @@ class ArkResponsesProvider(Provider):
                     rehydrate_msgs: List[dict] = []
                     if self._rehydrate_on_recreate and contexts:
                         rehydrate_msgs = self._contexts_to_ark_messages(contexts)
-                        rehydrated = bool(rehydrate_msgs)  # <<< 新增：设置标志
+                        rehydrated = bool(rehydrate_msgs)
                         logger.info(
                             "[ArkResponses] rehydrate on recreate (stream): "
                             "%d messages injected",
@@ -977,11 +988,12 @@ class ArkResponsesProvider(Provider):
                     payload.pop("tools", None)
                     if func_tool:
                         self._attach_tools_if_first_round(payload, func_tool)
+                    # 重建会话时不再携带上一轮 tool_outputs
                     payload["input"] = self._build_input_array(
                         first_round=True,
                         prompt=prompt,
                         system_prompt=system_prompt,
-                        tool_calls_result=tool_calls_result,
+                        tool_calls_result=None,
                         rehydrate_messages=rehydrate_msgs or None,
                     )
 
@@ -1083,7 +1095,7 @@ class ArkResponsesProvider(Provider):
             # 更新状态（以完成事件中的 id 为准）
             if new_id:
                 state.last_id = new_id
-            # <<< 修正：将 rehydrated 纳入 tools_sent 的更新条件，与非流式保持一致
+            # 将 rehydrated 纳入 tools_sent 的更新条件，与非流式保持一致
             if (first_round or rehydrated) and ("tools" in payload) and (not state.tools_sent):
                 state.tools_sent = True
             self._state[skey] = state
